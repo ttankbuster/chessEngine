@@ -471,7 +471,6 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
                         Clay_String squareIdString = { .chars = squareStr, .length = 2 };
                         if (Clay_PointerOver(CLAY_SID(squareIdString))) {
                             PieceType clickedPiece = state->chess.board[row][col];
-                            // printf("Clicked square %s -> piece value = %d\n", squareStr, (int)clickedPiece);
 
                             /* convenience locals for selection */
                             int selR = state->chess.selectedRow;
@@ -484,26 +483,52 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
                                     /* clicked the selected square -> deselect */
                                     state->chess.selectedRow = -1;
                                     state->chess.selectedCol = -1;
-                                    // printf("Deselected %s\n", squareStr);
                                 } else if (isLegalMove(&state->chess, selR, selC, row, col)) {
                                     /* perform move */
                                     PieceType moving = state->chess.board[selR][selC];
+                                    
+                                    /* Check if this is a castling move */
+                                    bool isCastling = false;
+                                    if ((moving == WHITE_KING || moving == BLACK_KING) && 
+                                        selC == 4 && abs(col - selC) == 2) {
+                                        isCastling = true;
+                                        
+                                        /* Move the rook */
+                                        int rookFromCol = (col == 6) ? 7 : 0;
+                                        int rookToCol = (col == 6) ? 5 : 3;
+                                        PieceType rook = state->chess.board[row][rookFromCol];
+                                        state->chess.board[row][rookToCol] = rook;
+                                        state->chess.board[row][rookFromCol] = EMPTY;
+                                        
+                                        /* Mark that this side has castled */
+                                        if (moving == WHITE_KING) {
+                                            state->chess.hasCastledWhite[(col == 6) ? 0 : 1] = true;
+                                        } else {
+                                            state->chess.hasCastledBlack[(col == 6) ? 0 : 1] = true;
+                                        }
+                                        
+                                        printf("CASTLE: %s side\n", (col == 6) ? "King" : "Queen");
+                                    }
+                                    
+                                    /* Move the king (or other piece) */
                                     state->chess.board[row][col] = moving;
                                     state->chess.board[selR][selC] = EMPTY;
+                                    
                                     state->chess.selectedRow = -1;
                                     state->chess.selectedCol = -1;
                                     state->chess.whiteToMove = !state->chess.whiteToMove;
-                                    printf("MOVE: %c%d -> %c%d (piece %d)\n", 'A'+selC, 1+selR, 'A'+col, 1+row, (int)moving);
+                                    
+                                    if (!isCastling) {
+                                        printf("MOVE: %c%d -> %c%d (piece %d)\n", 'A'+selC, 1+selR, 'A'+col, 1+row, (int)moving);
+                                    }
                                 } else {
                                     /* not a legal move: if clicked an own piece, change selection, otherwise deselect */
                                     if (clickedPiece != EMPTY && ((state->chess.whiteToMove && !isBlack(clickedPiece)) || (!state->chess.whiteToMove && isBlack(clickedPiece)))) {
                                         state->chess.selectedRow = row;
                                         state->chess.selectedCol = col;
-                                        // printf("Changed selection to %s (piece %d)\n", squareStr, (int)clickedPiece);
                                     } else {
                                         state->chess.selectedRow = -1;
                                         state->chess.selectedCol = -1;
-                                        // printf("Click not a legal move and not selecting an own piece -> deselect\n");
                                     }
                                 }
                             } else {
@@ -511,10 +536,6 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
                                 if (clickedPiece != EMPTY && ((state->chess.whiteToMove && !isBlack(clickedPiece)) || (!state->chess.whiteToMove && isBlack(clickedPiece)))) {
                                     state->chess.selectedRow = row;
                                     state->chess.selectedCol = col;
-                                    // printf("Selected %s (piece %d)\n", squareStr, (int)clickedPiece);
-                                } else {
-                                    /* clicked empty square or opponent piece with no selection -> nothing to do */
-                                    // printf("No selection and clicked empty or opponent piece\n");
                                 }
                             }
 
@@ -523,7 +544,6 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
                     }
                 }
                 if (!found) {
-                    /* clicked outside the board */
                     printf("Clicked: no board square under mouse\n");
                 }
             }
@@ -538,6 +558,10 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
     return SDL_APP_CONTINUE;
 }
 
+
+void calculateMove(ChessState){
+
+}
 
 SDL_AppResult SDL_AppIterate(void* appstate) {
     AppState* state = appstate;
