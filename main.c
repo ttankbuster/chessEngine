@@ -12,7 +12,6 @@
 #include "external/clay/clay_renderer_SDL3.c"
 
 static const Uint32 FONT_ID = 0;
-
 static const Clay_Color COLOR_BG = { 235, 235, 235, 255 };
 static const Clay_Color COLOR_TOOLBAR = { 200, 200, 200, 255 };
 static const Clay_Color COLOR_SURFACE = { 0, 0, 0, 255 };
@@ -20,12 +19,25 @@ static const Clay_Color COLOR_TEXT = { 30, 30, 30, 255 };
 static const Clay_Color COLOR_SQUARE_BLACK = {100, 100, 100, 255};
 static const Clay_Color COLOR_SQUARE_WHITE = {200, 200, 200, 255};
 
-
 typedef enum {
     EMPTY = 0,
     WHITE_PAWN, WHITE_KNIGHT, WHITE_BISHOP, WHITE_ROOK, WHITE_QUEEN, WHITE_KING,
     BLACK_PAWN, BLACK_KNIGHT, BLACK_BISHOP, BLACK_ROOK, BLACK_QUEEN, BLACK_KING
 } PieceType;
+
+typedef struct {
+    int fromRow, fromCol;
+    int toRow, toCol;
+    PieceType captured;
+    bool isPromotion;
+    bool isEnPassant;
+    bool isCastling;
+} Move;
+
+typedef struct {
+    Move moves[256];
+    int count;
+} MoveList;
 
 typedef struct {
     PieceType board[8][8];
@@ -37,6 +49,7 @@ typedef struct {
     int enPassantCol;  // -1 if none available
     SDL_Texture* pieceTextures[13]; // index = PieceType
 } ChessState;
+
 typedef struct app_state {
     SDL_Window* window;
     Clay_SDL3RendererData rendererData;
@@ -61,7 +74,6 @@ static void HandleClayErrors(Clay_ErrorData errorData) {
     }
 }
 
-
 static SDL_Texture* LoadTexture(SDL_Renderer* renderer, const char* path) {
     SDL_Surface* surface = IMG_Load(path);
     if (!surface) {
@@ -78,6 +90,7 @@ static SDL_Texture* LoadTexture(SDL_Renderer* renderer, const char* path) {
 
     return tex;
 }
+
 static void LoadChessTextures(ChessState* chess, SDL_Renderer* renderer) {
     memset(chess->pieceTextures, 0, sizeof(chess->pieceTextures));
 
@@ -95,7 +108,6 @@ static void LoadChessTextures(ChessState* chess, SDL_Renderer* renderer) {
     chess->pieceTextures[BLACK_QUEEN]  = LoadTexture(renderer, "external/resources/chess_pieces/bq.png");
     chess->pieceTextures[BLACK_KING]   = LoadTexture(renderer, "external/resources/chess_pieces/bk.png");
 }
-
 
 ChessState initChessState() {
     ChessState chess = {0};
@@ -133,6 +145,191 @@ ChessState initChessState() {
     chess.hasCastledBlack[1] = false;
     chess.enPassantCol = -1;
     return chess;
+}
+
+static inline bool inBounds(int r, int c) {
+    return r >= 0 && r < 8 && c >= 0 && c < 8;
+}
+
+static inline bool isWhite(PieceType p) {
+    return p >= WHITE_PAWN && p <= WHITE_KING;
+}
+
+static inline bool isBlack(PieceType p) {
+    return p >= BLACK_PAWN && p <= BLACK_KING;
+}
+
+static inline bool sameColor(PieceType a, PieceType b) {
+    return (isWhite(a) && isWhite(b)) || (isBlack(a) && isBlack(b));
+}
+
+bool pathClear(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    int dr = (tr > fr) - (tr < fr);
+    int dc = (tc > fc) - (tc < fc);
+
+    for (int r = fr + dr, c = fc + dc; r != tr || c != tc; r += dr, c += dc) {
+        if (chess->board[r][c] != EMPTY)
+            return false;
+    }
+    return true;
+}
+
+bool knightMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    int dr = abs(tr - fr);
+    int dc = abs(tc - fc);
+    return (dr == 2 && dc == 1) || (dr == 1 && dc == 2);
+}
+
+bool rookMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    if (fr != tr && fc != tc) return false;
+    return pathClear(chess, fr, fc, tr, tc);
+}
+
+bool bishopMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    if (abs(fr - tr) != abs(fc - tc)) return false;
+    return pathClear(chess, fr, fc, tr, tc);
+}
+
+bool queenMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    return rookMove(chess, fr, fc, tr, tc) || bishopMove(chess, fr, fc, tr, tc);
+}
+
+bool pawnMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    PieceType p = chess->board[fr][fc];
+    int dir = isWhite(p) ? +1 : -1;
+    int startRow = isWhite(p) ? 1 : 6;
+    if (fc == tc && tr == fr + dir && chess->board[tr][tc] == EMPTY)
+        return true;
+    if (fc == tc && fr == startRow && tr == fr + 2*dir &&
+        chess->board[fr + dir][fc] == EMPTY &&
+        chess->board[tr][tc] == EMPTY)
+        return true;
+    if (abs(tc - fc) == 1 && tr == fr + dir &&
+        chess->board[tr][tc] != EMPTY)
+        return true;
+    return false;
+}
+
+bool isSquareAttacked(const ChessState* chess, int r, int c, bool byWhite);
+bool isLegalMove(const ChessState* chess, int fr, int fc, int tr, int tc);
+bool canPieceAttackSquare(const ChessState* chess, int fr, int fc, int tr, int tc);
+
+bool isKingInCheck(const ChessState* chess, bool whiteKing) {
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            PieceType p = chess->board[r][c];
+            if ((whiteKing && p == WHITE_KING) ||
+                (!whiteKing && p == BLACK_KING)) {
+                return isSquareAttacked(chess, r, c, !whiteKing);
+            }
+        }
+    }
+    return false;
+}
+
+bool canCastle(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    PieceType king = chess->board[fr][fc];
+    bool white = isWhite(king);
+    if (white && fr != 0) return false;
+    if (!white && fr != 7) return false;
+    if (fc != 4) return false;
+    int rookCol = (tc == 6) ? 7 : 0;
+    int step = (tc > fc) ? 1 : -1;
+    if (white && chess->hasCastledWhite[(tc == 6) ? 0 : 1]) return false;
+    if (!white && chess->hasCastledBlack[(tc == 6) ? 0 : 1]) return false;
+    if (chess->board[fr][rookCol] != (white ? WHITE_ROOK : BLACK_ROOK))
+        return false;
+    for (int c = fc + step; c != rookCol; c += step)
+        if (chess->board[fr][c] != EMPTY) return false;
+    if (isKingInCheck(chess, white)) return false;
+    for (int c = fc; c != tc + step; c += step)
+        if (isSquareAttacked(chess, fr, c, !white)) return false;
+    return true;
+}
+
+bool moveLeavesKingSafe(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    ChessState copy = *chess;
+    copy.board[tr][tc] = copy.board[fr][fc];
+    copy.board[fr][fc] = EMPTY;
+
+    bool white = isWhite(copy.board[tr][tc]);
+    return !isKingInCheck(&copy, white);
+}
+
+bool kingMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    if (abs(fr - tr) <= 1 && abs(fc - tc) <= 1)
+        return true;
+
+    if (fr == tr && (tc == 6 || tc == 2))
+        return canCastle(chess, fr, fc, tr, tc);
+
+    return false;
+}
+
+bool isLegalMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    if (!inBounds(tr, tc)) return false;
+    PieceType p = chess->board[fr][fc];
+    PieceType target = chess->board[tr][tc];
+    if (p == EMPTY) return false;
+    if (sameColor(p, target)) return false;
+    bool ok = false;
+    switch (p) {
+        case WHITE_PAWN:
+        case BLACK_PAWN:   ok = pawnMove(chess, fr, fc, tr, tc); break;
+        case WHITE_KNIGHT:
+        case BLACK_KNIGHT: ok = knightMove(chess, fr, fc, tr, tc); break;
+        case WHITE_BISHOP:
+        case BLACK_BISHOP: ok = bishopMove(chess, fr, fc, tr, tc); break;
+        case WHITE_ROOK:
+        case BLACK_ROOK:   ok = rookMove(chess, fr, fc, tr, tc); break;
+        case WHITE_QUEEN:
+        case BLACK_QUEEN:  ok = queenMove(chess, fr, fc, tr, tc); break;
+        case WHITE_KING:
+        case BLACK_KING:   ok = kingMove(chess, fr, fc, tr, tc); break;
+        default: return false;
+    }
+    if (!ok) return false;
+    return moveLeavesKingSafe(chess, fr, fc, tr, tc);
+}
+
+bool canPieceAttackSquare(const ChessState* chess, int fr, int fc, int tr, int tc) {
+    if (!inBounds(tr, tc)) return false;
+    PieceType p = chess->board[fr][fc];
+    PieceType target = chess->board[tr][tc];
+    if (p == EMPTY) return false;
+    if (sameColor(p, target)) return false;
+    
+    switch (p) {
+        case WHITE_PAWN:
+        case BLACK_PAWN:   return pawnMove(chess, fr, fc, tr, tc);
+        case WHITE_KNIGHT:
+        case BLACK_KNIGHT: return knightMove(chess, fr, fc, tr, tc);
+        case WHITE_BISHOP:
+        case BLACK_BISHOP: return bishopMove(chess, fr, fc, tr, tc);
+        case WHITE_ROOK:
+        case BLACK_ROOK:   return rookMove(chess, fr, fc, tr, tc);
+        case WHITE_QUEEN:
+        case BLACK_QUEEN:  return queenMove(chess, fr, fc, tr, tc);
+        case WHITE_KING:
+        case BLACK_KING:   
+            return (abs(fr - tr) <= 1 && abs(fc - tc) <= 1);
+        default: return false;
+    }
+}
+
+bool isSquareAttacked(const ChessState* chess, int r, int c, bool byWhite) {
+    for (int fr = 0; fr < 8; fr++) {
+        for (int fc = 0; fc < 8; fc++) {
+            PieceType p = chess->board[fr][fc];
+            if (p == EMPTY) continue;
+            if (byWhite && !isWhite(p)) continue;
+            if (!byWhite && !isBlack(p)) continue;
+
+            if (canPieceAttackSquare(chess, fr, fc, r, c))
+                return true;
+        }
+    }
+    return false;
 }
 
 void renderChessPiece(SDL_Texture** pieceTextures, PieceType piece, Clay_String squareIdString)
@@ -177,16 +374,30 @@ void renderChessBoard(ChessState chess,bool isWhite){
                     Clay_String squareIdString={.chars=squareStr,.length=2};
                     bool light = (((int)col + (int)row) % 2) == 0;
                     bool hovered = Clay_PointerOver(CLAY_SID(squareIdString));
-                    Clay_Color squareColor = hovered ? (Clay_Color){255,0,0,255} : (light ? COLOR_SQUARE_WHITE : COLOR_SQUARE_BLACK);
+                    bool selected = (row == chess.selectedRow) && (col == chess.selectedCol);
+                    bool moveable = isLegalMove(&chess, chess.selectedRow, chess.selectedCol, row, col);
+                    int state = selected ? 1 : moveable ? 2 : hovered  ? 3 : 0;
+                    Clay_Color squareColor;
+                    switch (state) {
+                        case 1:
+                            squareColor = (Clay_Color){255,255,0,255};
+                            break;
+                        case 2:
+                            squareColor = (Clay_Color){0,0,255,255};
+                            break;
+                        case 3:
+                            squareColor = (Clay_Color){255,0,0,255};
+                            break;
+                        default:
+                            squareColor = light ? COLOR_SQUARE_WHITE : COLOR_SQUARE_BLACK;
+                            break;
+                    }
                     CLAY(CLAY_SID(squareIdString),{.aspectRatio=1,.backgroundColor=squareColor,.layout={.sizing=expand}}){ renderChessPiece(chess.pieceTextures,chess.board[row][col],squareIdString); };
                 }
             };
         }
     };
 }
-
-
-
 
 static Clay_RenderCommandArray CreateLayout(AppState* state) {
     Clay_BeginLayout();
@@ -233,8 +444,9 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[]) {
     *appstate = state;
     return SDL_APP_CONTINUE;
 }
+
 SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
-    (void)appstate;
+    AppState* state = (AppState*)appstate;
     switch (event->type) {
         case SDL_EVENT_QUIT:
             return SDL_APP_SUCCESS;
@@ -244,9 +456,79 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
         case SDL_EVENT_MOUSE_MOTION:
             Clay_SetPointerState((Clay_Vector2){ event->motion.x, event->motion.y }, event->motion.state & SDL_BUTTON_LMASK);
             break;
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+            /* Update pointer state first so Clay_PointerOver uses current mouse position */
             Clay_SetPointerState((Clay_Vector2){ event->button.x, event->button.y }, event->button.button == SDL_BUTTON_LEFT);
+
+            if (event->button.button == SDL_BUTTON_LEFT && state) {
+                bool found = false;
+                const bool isWhite = true; /* keep same orientation as rendering */
+                for (char r = 0; r < 8 && !found; r++) {
+                    char row = isWhite ? (char)(7 - r) : r;
+                    for (char c = 0; c < 8 && !found; c++) {
+                        char col = isWhite ? (char)(7 - c) : c;
+                        char squareStr[3] = { (char)('A' + col), (char)('1' + row), '\0' };
+                        Clay_String squareIdString = { .chars = squareStr, .length = 2 };
+                        if (Clay_PointerOver(CLAY_SID(squareIdString))) {
+                            PieceType clickedPiece = state->chess.board[row][col];
+                            // printf("Clicked square %s -> piece value = %d\n", squareStr, (int)clickedPiece);
+
+                            /* convenience locals for selection */
+                            int selR = state->chess.selectedRow;
+                            int selC = state->chess.selectedCol;
+                            bool hasSelection = (selR >= 0 && selC >= 0);
+
+                            /* If there's an active selection, try move first (if it's not the same square) */
+                            if (hasSelection) {
+                                if (selR == row && selC == col) {
+                                    /* clicked the selected square -> deselect */
+                                    state->chess.selectedRow = -1;
+                                    state->chess.selectedCol = -1;
+                                    // printf("Deselected %s\n", squareStr);
+                                } else if (isLegalMove(&state->chess, selR, selC, row, col)) {
+                                    /* perform move */
+                                    PieceType moving = state->chess.board[selR][selC];
+                                    state->chess.board[row][col] = moving;
+                                    state->chess.board[selR][selC] = EMPTY;
+                                    state->chess.selectedRow = -1;
+                                    state->chess.selectedCol = -1;
+                                    state->chess.whiteToMove = !state->chess.whiteToMove;
+                                    printf("MOVE: %c%d -> %c%d (piece %d)\n", 'A'+selC, 1+selR, 'A'+col, 1+row, (int)moving);
+                                } else {
+                                    /* not a legal move: if clicked an own piece, change selection, otherwise deselect */
+                                    if (clickedPiece != EMPTY && ((state->chess.whiteToMove && !isBlack(clickedPiece)) || (!state->chess.whiteToMove && isBlack(clickedPiece)))) {
+                                        state->chess.selectedRow = row;
+                                        state->chess.selectedCol = col;
+                                        // printf("Changed selection to %s (piece %d)\n", squareStr, (int)clickedPiece);
+                                    } else {
+                                        state->chess.selectedRow = -1;
+                                        state->chess.selectedCol = -1;
+                                        // printf("Click not a legal move and not selecting an own piece -> deselect\n");
+                                    }
+                                }
+                            } else {
+                                /* no current selection: if clicked an own piece, select it */
+                                if (clickedPiece != EMPTY && ((state->chess.whiteToMove && !isBlack(clickedPiece)) || (!state->chess.whiteToMove && isBlack(clickedPiece)))) {
+                                    state->chess.selectedRow = row;
+                                    state->chess.selectedCol = col;
+                                    // printf("Selected %s (piece %d)\n", squareStr, (int)clickedPiece);
+                                } else {
+                                    /* clicked empty square or opponent piece with no selection -> nothing to do */
+                                    // printf("No selection and clicked empty or opponent piece\n");
+                                }
+                            }
+
+                            found = true;
+                        }
+                    }
+                }
+                if (!found) {
+                    /* clicked outside the board */
+                    printf("Clicked: no board square under mouse\n");
+                }
+            }
             break;
+        }
         case SDL_EVENT_MOUSE_WHEEL:
             Clay_UpdateScrollContainers(true, (Clay_Vector2){ event->wheel.x, event->wheel.y }, 0.01f);
             break;
@@ -255,6 +537,8 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
     }
     return SDL_APP_CONTINUE;
 }
+
+
 SDL_AppResult SDL_AppIterate(void* appstate) {
     AppState* state = appstate;
     Clay_RenderCommandArray commands = CreateLayout(state);
