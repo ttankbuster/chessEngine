@@ -12,6 +12,7 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <SDL3_image/SDL_image.h>
+#include <SDL3/SDL_atomic.h>
 
 #define CLAY_IMPLEMENTATION
 #include "external/clay/clay.h"
@@ -87,7 +88,9 @@ typedef struct {
 } ChessState;
 
 typedef struct {
-    bool searching;
+    SDL_AtomicInt nodesSearched;
+    SDL_AtomicInt depthCompleted;
+    SDL_AtomicInt searching;   /* 1 = running, 0 = idle */
 } EngineProgress;
 
 typedef struct {
@@ -108,7 +111,7 @@ typedef struct {
 /* forward declarations */
 void getAllMoves(ChessState* chess, MoveList* moves);
 int evaluateMaterial(ChessState* chess, bool whitePerspective);
-Move findBestMove(ChessState* chess, int depth);
+Move findBestMove(ChessState* chess, int depth, Engine* engine);
 void makeMove(ChessState* chess, Move move, void* _undo);
 void unmakeMove(ChessState* chess, Move move, void* _undo);
 
@@ -418,7 +421,8 @@ void unmakeMove(ChessState* chess, Move move, void* _undo) {
 }
 
 /* minimax & findBestMove (kept simple) */
-int minimax(ChessState* chess, int depth, bool whitePerspective) {
+int minimax(ChessState* chess, int depth, bool whitePerspective, Engine* engine) {
+    SDL_AddAtomicInt(&engine->progress.nodesSearched, 1);
     if (depth == 0) return evaluateMaterial(chess, whitePerspective);
     MoveList moves = {0};
     getAllMoves(chess, &moves);
@@ -432,7 +436,7 @@ int minimax(ChessState* chess, int depth, bool whitePerspective) {
             Move m = moves.moves[i];
             UndoInfo u;
             makeMove(chess, m, &u);
-            int score = minimax(chess, depth-1, !whitePerspective);
+            int score = minimax(chess, depth-1, !whitePerspective, engine);
             unmakeMove(chess, m, &u);
             if (score > best) best = score;
         }
@@ -443,7 +447,7 @@ int minimax(ChessState* chess, int depth, bool whitePerspective) {
             Move m = moves.moves[i];
             UndoInfo u;
             makeMove(chess, m, &u);
-            int score = minimax(chess, depth-1, !whitePerspective);
+            int score = minimax(chess, depth-1, !whitePerspective, engine);
             unmakeMove(chess, m, &u);
             if (score < best) best = score;
         }
@@ -451,7 +455,7 @@ int minimax(ChessState* chess, int depth, bool whitePerspective) {
     }
 }
 
-Move findBestMove(ChessState* chess, int depth) {
+Move findBestMove(ChessState* chess, int depth, Engine* engine){
     MoveList moves = {0};
     getAllMoves(chess, &moves);
     if (moves.count == 0) { Move empty = {0}; return empty; }
@@ -462,7 +466,7 @@ Move findBestMove(ChessState* chess, int depth) {
             Move mv = moves.moves[i];
             UndoInfo u;
             makeMove(chess, mv, &u);
-            int eval = minimax(chess, depth-1, false);
+            int eval = minimax(chess, depth-1, false, engine);
             unmakeMove(chess, mv, &u);
             if (eval > bestEval) { bestEval = eval; bestMove = mv; }
         }
@@ -472,7 +476,7 @@ Move findBestMove(ChessState* chess, int depth) {
             Move mv = moves.moves[i];
             UndoInfo u;
             makeMove(chess, mv, &u);
-            int eval = minimax(chess, depth-1, true);
+            int eval = minimax(chess, depth-1, true, engine);
             unmakeMove(chess, mv, &u);
             if (eval < bestEval) { bestEval = eval; bestMove = mv; }
         }
@@ -482,22 +486,33 @@ Move findBestMove(ChessState* chess, int depth) {
 
 /* Engine thread: copies chess state, searches, writes result under mutex */
 static int engine_thread_func(void* arg) {
-    AppState* app = (AppState*)arg;
+    AppState* state = arg;
 
-    /* make a snapshot copy */
-    ChessState searchState;
-    SDL_LockMutex(app->engine.mutex);
-    searchState = app->chess; /* shallow copy is OK for search */
-    SDL_UnlockMutex(app->engine.mutex);
+    SDL_SetAtomicInt(&state->engine.progress.nodesSearched, 0);
+    SDL_SetAtomicInt(&state->engine.progress.depthCompleted, 0);
+    SDL_SetAtomicInt(&state->engine.progress.searching, 1);
 
-    const int depth = 4;
-    Move result = findBestMove(&searchState, depth);
+    Engine* engine = &state->engine;
 
-    SDL_LockMutex(app->engine.mutex);
-    app->engine.resultMove = result;
-    app->engine.hasMove = true;
-    SDL_UnlockMutex(app->engine.mutex);
+    ChessState snapshot;
+    SDL_LockMutex(state->engine.mutex);
+    snapshot = state->chess;
+    SDL_UnlockMutex(state->engine.mutex);
 
+    Move best = {0};
+    const int maxDepth = 5;
+
+    for (int d = 1; d <= maxDepth; d++) {
+        best = findBestMove(&snapshot, d, engine);
+        SDL_SetAtomicInt(&state->engine.progress.depthCompleted, d);
+    }
+
+    SDL_LockMutex(state->engine.mutex);
+    state->engine.resultMove = best;
+    state->engine.hasMove = true;
+    SDL_UnlockMutex(state->engine.mutex);
+
+    SDL_SetAtomicInt(&state->engine.progress.searching, 0);
     return 0;
 }
 
@@ -549,16 +564,61 @@ void renderChessBoard(ChessState chess, bool isWhiteView) {
 }
 
 static Clay_RenderCommandArray CreateLayout(AppState* state) {
+    int nodes     = SDL_GetAtomicInt(&state->engine.progress.nodesSearched);
+    int depth     = SDL_GetAtomicInt(&state->engine.progress.depthCompleted);
+    int searching = SDL_GetAtomicInt(&state->engine.progress.searching);
+    const int maxDepth = 5;
+    const int barTotalW = 300;
+    const int barInnerMax = (barTotalW - 8);
+    float t = 0.0f;
+    if (searching && maxDepth > 0) t = (float)depth / (float)maxDepth;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    int innerW = (int)(barInnerMax * t);
     Clay_BeginLayout();
     Clay_Sizing expand = { .width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0) };
     CLAY(CLAY_ID("Root"), { .layout = { .layoutDirection = CLAY_TOP_TO_BOTTOM, .sizing = expand }, .backgroundColor = COLOR_BG }) {
-        CLAY(CLAY_ID("Chess"), { .layout = { .sizing = { .width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(48) }, .padding = CLAY_PADDING_ALL(12) }, .backgroundColor = COLOR_TOOLBAR }) {
-            CLAY_TEXT(CLAY_STRING("Chess"), CLAY_TEXT_CONFIG({ .fontId = FONT_ID, .fontSize = 20, .textColor = COLOR_TEXT }));
+        CLAY(CLAY_ID("Toolbar"), {
+            .layout = {
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .sizing = { .width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(48) },
+                .padding = CLAY_PADDING_ALL(12)
+            },
+            .backgroundColor = COLOR_TOOLBAR
+        }) {
+            CLAY_TEXT(CLAY_STRING("Chess"), CLAY_TEXT_CONFIG({
+                .fontId = FONT_ID, .fontSize = 20, .textColor = COLOR_TEXT
+            }));
+            CLAY(CLAY_ID("Spacer"), { .layout = { .sizing = { .width = CLAY_SIZING_GROW(0) } } }) {}
+            CLAY(CLAY_ID("ProgressColumn"), { .layout = { .sizing = { .width = CLAY_SIZING_FIXED(barTotalW) } } }) {
+                CLAY(CLAY_ID("ProgOuter"), {
+                    .layout = {
+                        .sizing = { .width = CLAY_SIZING_FIXED(barTotalW), .height = CLAY_SIZING_FIXED(20) },
+                        .padding = CLAY_PADDING_ALL(4)
+                    },
+                    .backgroundColor = (Clay_Color){160,160,160,255}
+                }) {
+                    CLAY(CLAY_ID("ProgInner"), {
+                        .layout = { .sizing = { .width = CLAY_SIZING_FIXED(innerW), .height = CLAY_SIZING_FIXED(12) } },
+                        .backgroundColor = searching ? (Clay_Color){80,120,200,255} : (Clay_Color){120,120,120,255}
+                    }) {}
+                };
+                {
+                    char statusBuf[80];
+                    SDL_snprintf(statusBuf, sizeof(statusBuf), "%s  depth: %d/%d  nodes: %d",
+                                 searching ? "Searching" : "Idle",
+                                 depth, maxDepth, nodes);
+                    Clay_String statusStr = { .chars = statusBuf, .length = (int)SDL_strlen(statusBuf) };
+                    CLAY_TEXT(statusStr, CLAY_TEXT_CONFIG({ .fontId = FONT_ID, .fontSize = 12, .textColor = COLOR_TEXT }));
+                }
+            }
         }
         CLAY(CLAY_ID("Content"), { .layout = { .sizing = expand, .padding = CLAY_PADDING_ALL(24), .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } } }) {
             renderChessBoard(state->chess, true);
         }
     }
+
     return Clay_EndLayout();
 }
 
