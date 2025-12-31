@@ -1,18 +1,20 @@
-/* threaded SDL3 + Clay chess (SDL3 names fixed)
-   - Fixes: SDL_Mutex type and SDL_DestroySurface usage
-   - Engine runs in background thread; main thread applies move when ready.
-*/
+// CHESS ENGINE
 
+// standard includes
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+//SDL (SDL3 stored in external)
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_atomic.h>
+#define INF 1000000 // cant use INFINITY from math.h include coz it doesnt convert to integer
+#define MOVE_DEPTH 5
+
 
 #define CLAY_IMPLEMENTATION
 #include "external/clay/clay.h"
@@ -32,6 +34,7 @@ typedef enum {
     BLACK_PAWN, BLACK_KNIGHT, BLACK_BISHOP, BLACK_ROOK, BLACK_QUEEN, BLACK_KING
 } PieceType;
 
+// same order as PIECE TYPe
 int PIECE_VALUES[13] = { 0,
     1, 3, 4, 5, 9, 0,
     1, 3, 4, 5, 9, 0
@@ -47,7 +50,7 @@ typedef struct {
     bool isCastling;
 } Move;
 
-char* move2chars(Move move) {
+char* move2chars(Move move) { // for printing moves
     static char moveStr[32];
     char fromFile = 'a' + move.fromCol;
     char fromRank = '1' + move.fromRow;
@@ -88,9 +91,10 @@ typedef struct {
 } ChessState;
 
 typedef struct {
+    //atomics let you change them during multithreading without it going tits up
     SDL_AtomicInt nodesSearched;
     SDL_AtomicInt depthCompleted;
-    SDL_AtomicInt searching;   /* 1 = running, 0 = idle */
+    SDL_AtomicInt searching;   // 1 = running, 0 = idle
 } EngineProgress;
 
 typedef struct {
@@ -108,10 +112,10 @@ typedef struct {
     Engine engine;
 } AppState;
 
-/* forward declarations */
+// so they are available later in code
 void getAllMoves(ChessState* chess, MoveList* moves);
-int evaluateMaterial(ChessState* chess, bool whitePerspective);
-Move findBestMove(ChessState* chess, int depth, Engine* engine);
+int evaluateMaterial(ChessState* chess);
+Move findBestMove(ChessState* chess, int depth, Engine* enginePtr);
 void makeMove(ChessState* chess, Move move, void* _undo);
 void unmakeMove(ChessState* chess, Move move, void* _undo);
 
@@ -139,7 +143,7 @@ static SDL_Texture* LoadTexture(SDL_Renderer* renderer, const char* path) {
         return NULL;
     }
     SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
-    SDL_DestroySurface(surf); /* SDL3 function (fixed) */
+    SDL_DestroySurface(surf);
     if (!tex) SDL_Log("CreateTexture failed for %s: %s", path, SDL_GetError());
     return tex;
 }
@@ -177,16 +181,15 @@ ChessState initChessState(void) {
     return chess;
 }
 
-/* helpers & move generation (kept similar to your logic) */
 static inline bool inBounds(int r, int c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
 static inline bool isWhite(PieceType p) { return p >= WHITE_PAWN && p <= WHITE_KING; }
 static inline bool isBlack(PieceType p) { return p >= BLACK_PAWN && p <= BLACK_KING; }
 static inline bool sameColor(PieceType a, PieceType b) { return (isWhite(a) && isWhite(b)) || (isBlack(a) && isBlack(b)); }
 
 bool pathClear(const ChessState* chess, int fr, int fc, int tr, int tc) {
-    int dr = (tr > fr) - (tr < fr);
-    int dc = (tc > fc) - (tc < fc);
-    for (int r = fr + dr, c = fc + dc; r != tr || c != tc; r += dr, c += dc) {
+    int dr = (tr > fr) - (tr < fr); //difference row
+    int dc = (tc > fc) - (tc < fc); //difference column
+    for (int r = fr + dr, c = fc + dc; r != tr || c != tc; r += dr, c += dc) { //raycasts checking each cell is empty between
         if (chess->board[r][c] != EMPTY) return false;
     }
     return true;
@@ -199,7 +202,7 @@ bool rookMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
     if (fr != tr && fc != tc) return false;
     return pathClear(chess, fr, fc, tr, tc);
 }
-bool bishopMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
+bool bishopMove(const ChessState* chess, int fr, int fc, int tr, int tc) { // raycasts like rook but different move vector
     if (abs(fr - tr) != abs(fc - tc)) return false;
     return pathClear(chess, fr, fc, tr, tc);
 }
@@ -215,6 +218,8 @@ bool pawnMove(const ChessState* chess, int fr, int fc, int tr, int tc) {
     if (abs(tc - fc) == 1 && tr == fr + dir && chess->board[tr][tc] != EMPTY) return true;
     return false;
 }
+
+
 bool canPieceAttackSquare(const ChessState* chess, int fr, int fc, int tr, int tc) {
     if (!inBounds(tr, tc)) return false;
     PieceType p = chess->board[fr][fc];
@@ -321,16 +326,267 @@ void getAllMoves(ChessState* chess, MoveList* moves) {
     }
 }
 
-int evaluateMaterial(ChessState* chess, bool whitePerspective) {
-    int value = 0;
-    for (int r=0;r<8;r++) for (int c=0;c<8;c++){
-        PieceType p = chess->board[r][c];
-        if (p == EMPTY) continue;
-        int val = PIECE_VALUES[p];
-        if (isWhite(p)) value += (whitePerspective ? val : -val);
-        else value += (whitePerspective ? -val : val);
+
+// for preferred board placements of each piece
+// https://www.reddit.com/r/ComputerChess/comments/17v6dux/piece_position_in_evaluation/
+// tweaked from https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function
+static const int PAWN_TABLE[8][8] = {
+    {0,  0,  0,  0,  0,  0,  0,  0},
+    {50, 50, 50, 50, 50, 50, 50, 50},
+    {10, 10, 20, 30, 30, 20, 10, 10},
+    {5,  5, 10, 25, 25, 10,  5,  5},
+    {0,  0,  0, 20, 20,  0,  0,  0},
+    {5, -5,-10,  0,  0,-10, -5,  5},
+    {5, 10, 10,-20,-20, 10, 10,  5},
+    {0,  0,  0,  0,  0,  0,  0,  0}
+};
+
+static const int KNIGHT_TABLE[8][8] = {
+    {-50,-40,-30,-30,-30,-30,-40,-50},
+    {-40,-20,  0,  0,  0,  0,-20,-40},
+    {-30,  0, 10, 15, 15, 10,  0,-30},
+    {-30,  5, 15, 20, 20, 15,  5,-30},
+    {-30,  0, 15, 20, 20, 15,  0,-30},
+    {-30,  5, 10, 15, 15, 10,  5,-30},
+    {-40,-20,  0,  5,  5,  0,-20,-40},
+    {-50,-40,-30,-30,-30,-30,-40,-50}
+};
+
+static const int BISHOP_TABLE[8][8] = {
+    {-20,-10,-10,-10,-10,-10,-10,-20},
+    {-10,  0,  0,  0,  0,  0,  0,-10},
+    {-10,  0,  5, 10, 10,  5,  0,-10},
+    {-10,  5,  5, 10, 10,  5,  5,-10},
+    {-10,  0, 10, 10, 10, 10,  0,-10},
+    {-10, 10, 10, 10, 10, 10, 10,-10},
+    {-10,  5,  0,  0,  0,  0,  5,-10},
+    {-20,-10,-10,-10,-10,-10,-10,-20}
+};
+
+static const int ROOK_TABLE[8][8] = {
+    {0,  0,  0,  0,  0,  0,  0,  0},
+    {5, 10, 10, 10, 10, 10, 10,  5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {0,  0,  0,  5,  5,  0,  0,  0}
+};
+
+static const int QUEEN_TABLE[8][8] = {
+    {-20,-10,-10, -5, -5,-10,-10,-20},
+    {-10,  0,  0,  0,  0,  0,  0,-10},
+    {-10,  0,  5,  5,  5,  5,  0,-10},
+    {-5,  0,  5,  5,  5,  5,  0, -5},
+    {0,  0,  5,  5,  5,  5,  0, -5},
+    {-10,  5,  5,  5,  5,  5,  0,-10},
+    {-10,  0,  5,  0,  0,  0,  0,-10},
+    {-20,-10,-10, -5, -5,-10,-10,-20}
+};
+
+
+static const int KING_MIDDLE_TABLE[8][8] = {
+    {-30,-40,-40,-50,-50,-40,-40,-30},
+    {-30,-40,-40,-50,-50,-40,-40,-30},
+    {-30,-40,-40,-50,-50,-40,-40,-30},
+    {-30,-40,-40,-50,-50,-40,-40,-30},
+    {-20,-30,-30,-40,-40,-30,-30,-20},
+    {-10,-20,-20,-20,-20,-20,-20,-10},
+    {20, 20,  0,  0,  0,  0, 20, 20},
+    {20, 30, 10,  0,  0, 10, 30, 20}
+};
+// otherwise king doesnt get used offensively in endgame
+
+static const int KING_END_TABLE[8][8] = {
+    {-50,-40,-30,-20,-20,-30,-40,-50},
+    {-30,-20,-10,  0,  0,-10,-20,-30},
+    {-30,-10, 20, 30, 30, 20,-10,-30},
+    {-30,-10, 30, 40, 40, 30,-10,-30},
+    {-30,-10, 30, 40, 40, 30,-10,-30},
+    {-30,-10, 20, 30, 30, 20,-10,-30},
+    {-30,-30,  0,  0,  0,  0,-30,-30},
+    {-50,-30,-30,-30,-30,-30,-30,-50}
+};
+
+// Helper to get piece-square table value
+static int getPieceSquareValue(PieceType piece, int row, int col, bool endgame) {
+    // mirror row for black pieces
+    int tableRow = isWhite(piece) ? row : (7 - row);
+    
+    switch (piece) {
+        case WHITE_PAWN:
+        case BLACK_PAWN:
+            return PAWN_TABLE[tableRow][col];
+        case WHITE_KNIGHT:
+        case BLACK_KNIGHT:
+            return KNIGHT_TABLE[tableRow][col];
+        case WHITE_BISHOP:
+        case BLACK_BISHOP:
+            return BISHOP_TABLE[tableRow][col];
+        case WHITE_ROOK:
+        case BLACK_ROOK:
+            return ROOK_TABLE[tableRow][col];
+        case WHITE_QUEEN:
+        case BLACK_QUEEN:
+            return QUEEN_TABLE[tableRow][col];
+        case WHITE_KING:
+        case BLACK_KING:
+            return endgame ? KING_END_TABLE[tableRow][col] : KING_MIDDLE_TABLE[tableRow][col];
+        default:
+            return 0;
     }
-    return value;
+}
+
+// Count total material to determine game phase (amount of pieces)
+static int countTotalMaterial(ChessState* chess) {
+    int total = 0;
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            PieceType p = chess->board[r][c];
+            if (p != EMPTY && p != WHITE_KING && p != BLACK_KING) {
+                total += PIECE_VALUES[p];
+            }
+        }
+    }
+    return total;
+}
+
+int evaluatePosition(ChessState* chess) {
+    int materialScore = 0;
+    int positionalScore = 0;
+    
+    // Determine if we're in endgame (less than 13 points of material per side on average)
+    int totalMaterial = countTotalMaterial(chess);
+    bool endgame = totalMaterial < 26;
+    
+    // Material and positional evaluation
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            PieceType p = chess->board[r][c];
+            if (p == EMPTY) continue;
+            
+            int pieceValue = PIECE_VALUES[p] * 100; // Scale up material values
+            int posValue = getPieceSquareValue(p, r, c, endgame);
+            
+            if (isWhite(p)) {
+                materialScore += pieceValue;
+                positionalScore += posValue;
+            } else {
+                materialScore -= pieceValue;
+                positionalScore -= posValue;
+            }
+        }
+    }
+    
+    // Bonus for bishop pair
+    int whiteBishops = 0, blackBishops = 0;
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            if (chess->board[r][c] == WHITE_BISHOP) whiteBishops++;
+            if (chess->board[r][c] == BLACK_BISHOP) blackBishops++;
+        }
+    }
+    int bishopPairBonus = 0;
+    if (whiteBishops >= 2) bishopPairBonus += 50;
+    if (blackBishops >= 2) bishopPairBonus -= 50;
+    
+    // Bonus for controlling center squares
+    int centerControl = 0;
+    int centerSquares[4][2] = {{3,3}, {3,4}, {4,3}, {4,4}};
+    for (int i = 0; i < 4; i++) {
+        int r = centerSquares[i][0];
+        int c = centerSquares[i][1];
+        if (isSquareAttacked(chess, r, c, true)) centerControl += 10;
+        if (isSquareAttacked(chess, r, c, false)) centerControl -= 10;
+    }
+
+    int whiteMobility = 0, blackMobility = 0;
+    for (int fr = 0; fr < 8; fr++) {
+        for (int fc = 0; fc < 8; fc++) {
+            PieceType p = chess->board[fr][fc];
+            if (p == EMPTY) continue;
+            
+            for (int tr = 0; tr < 8; tr++) {
+                for (int tc = 0; tc < 8; tc++) {
+                    if (canPieceAttackSquare(chess, fr, fc, tr, tc)) {
+                        if (isWhite(p)) whiteMobility++;
+                        else blackMobility++;
+                    }
+                }
+            }
+        }
+    }
+    int mobilityScore = (whiteMobility - blackMobility) * 2;
+    
+    // Pawn structure evaluation
+    int pawnStructure = 0;
+    for (int c = 0; c < 8; c++) {
+        int whitePawns = 0, blackPawns = 0;
+        for (int r = 0; r < 8; r++) {
+            if (chess->board[r][c] == WHITE_PAWN) whitePawns++;
+            if (chess->board[r][c] == BLACK_PAWN) blackPawns++;
+        }
+        // Penalty for doubled pawns (bad)
+        if (whitePawns > 1) pawnStructure -= (whitePawns - 1) * 10;
+        if (blackPawns > 1) pawnStructure += (blackPawns - 1) * 10;
+    }
+    
+    // Check for isolated pawns (no friendly pawns on adjacent files (also bad))
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            PieceType p = chess->board[r][c];
+            if (p != WHITE_PAWN && p != BLACK_PAWN) continue;
+            
+            bool hasSupport = false;
+            for (int dc = -1; dc <= 1; dc += 2) {
+                int nc = c + dc;
+                if (nc < 0 || nc >= 8) continue;
+                for (int nr = 0; nr < 8; nr++) {
+                    if ((p == WHITE_PAWN && chess->board[nr][nc] == WHITE_PAWN) ||
+                        (p == BLACK_PAWN && chess->board[nr][nc] == BLACK_PAWN)) {
+                        hasSupport = true;
+                        break;
+                    }
+                }
+                if (hasSupport) break;
+            }
+            
+            if (!hasSupport) {
+                if (p == WHITE_PAWN) pawnStructure -= 15;
+                else pawnStructure += 15;
+            }
+        }
+    }
+    
+    // King safety in middlegame
+    int kingSafety = 0;
+    if (!endgame) {
+        // Find kings and check pawn shield
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (chess->board[r][c] == WHITE_KING) {
+                    // Check for pawn shield
+                    if (r < 7) {
+                        if (c > 0 && chess->board[r+1][c-1] == WHITE_PAWN) kingSafety += 15;
+                        if (chess->board[r+1][c] == WHITE_PAWN) kingSafety += 15;
+                        if (c < 7 && chess->board[r+1][c+1] == WHITE_PAWN) kingSafety += 15;
+                    }
+                }
+                if (chess->board[r][c] == BLACK_KING) {
+                    if (r > 0) {
+                        if (c > 0 && chess->board[r-1][c-1] == BLACK_PAWN) kingSafety -= 15;
+                        if (chess->board[r-1][c] == BLACK_PAWN) kingSafety -= 15;
+                        if (c < 7 && chess->board[r-1][c+1] == BLACK_PAWN) kingSafety -= 15;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Combine all factors
+    return materialScore + positionalScore + bishopPairBonus + 
+           centerControl + mobilityScore + pawnStructure + kingSafety;
 }
 
 typedef struct {
@@ -346,16 +602,13 @@ void makeMove(ChessState* chess, Move move, void* _undo) {
     UndoInfo undoLocal;
     UndoInfo* undo = (UndoInfo*)_undo;
     if (!undo) undo = &undoLocal;
-
     undo->hasCastledWhite[0] = chess->hasCastledWhite[0];
     undo->hasCastledWhite[1] = chess->hasCastledWhite[1];
     undo->hasCastledBlack[0] = chess->hasCastledBlack[0];
     undo->hasCastledBlack[1] = chess->hasCastledBlack[1];
     undo->enPassantCol = chess->enPassantCol;
     undo->capturedPiece = move.captured;
-
     PieceType moving = chess->board[move.fromRow][move.fromCol];
-
     if (move.isCastling) {
         int rookFromCol = (move.toCol == 6) ? 7 : 0;
         int rookToCol   = (move.toCol == 6) ? 5 : 3;
@@ -420,71 +673,131 @@ void unmakeMove(ChessState* chess, Move move, void* _undo) {
     chess->enPassantCol = undo->enPassantCol;
 }
 
-/* minimax & findBestMove (kept simple) */
-int minimax(ChessState* chess, int depth, bool whitePerspective, Engine* engine) {
+int minimaxAB(ChessState* chess, int depth, int alpha, int beta, Engine* engine) {
     SDL_AddAtomicInt(&engine->progress.nodesSearched, 1);
-    if (depth == 0) return evaluateMaterial(chess, whitePerspective);
+    if (depth == 0)
+        return evaluatePosition(chess); // white-positive, black-negative
     MoveList moves = {0};
     getAllMoves(chess, &moves);
     if (moves.count == 0) {
-        if (isKingInCheck(chess, chess->whiteToMove)) return whitePerspective ? -10000 : 10000;
-        return 0;
+        if (isKingInCheck(chess, chess->whiteToMove))
+            return chess->whiteToMove ? -10000 : 10000;
+        return 0; // stalemate
     }
-    if (whitePerspective) {
-        int best = -10000;
-        for (int i=0;i<moves.count;i++) {
-            Move m = moves.moves[i];
+    if (chess->whiteToMove) {
+        // MAX node
+        int best = -100000;
+        for (int i = 0; i < moves.count; i++) {
             UndoInfo u;
-            makeMove(chess, m, &u);
-            int score = minimax(chess, depth-1, !whitePerspective, engine);
-            unmakeMove(chess, m, &u);
+            makeMove(chess, moves.moves[i], &u);
+            int score = minimaxAB(chess, depth - 1, alpha, beta, engine);
+            unmakeMove(chess, moves.moves[i], &u);
             if (score > best) best = score;
+            if (best > alpha) alpha = best;
+            if (alpha >= beta)
+                break;
         }
         return best;
     } else {
-        int best = 10000;
-        for (int i=0;i<moves.count;i++) {
-            Move m = moves.moves[i];
+        int best = 100000;
+        for (int i = 0; i < moves.count; i++) {
             UndoInfo u;
-            makeMove(chess, m, &u);
-            int score = minimax(chess, depth-1, !whitePerspective, engine);
-            unmakeMove(chess, m, &u);
+            makeMove(chess, moves.moves[i], &u);
+            int score = minimaxAB(chess, depth - 1, alpha, beta, engine);
+            unmakeMove(chess, moves.moves[i], &u);
             if (score < best) best = score;
+            if (best < beta) beta = best;
+            if (alpha >= beta)
+                break;
         }
         return best;
     }
 }
 
-Move findBestMove(ChessState* chess, int depth, Engine* engine){
-    MoveList moves = {0};
-    getAllMoves(chess, &moves);
-    if (moves.count == 0) { Move empty = {0}; return empty; }
-    Move bestMove = moves.moves[0];
-    if (chess->whiteToMove) {
-        int bestEval = -10000;
-        for (int i=0;i<moves.count;i++){
-            Move mv = moves.moves[i];
-            UndoInfo u;
-            makeMove(chess, mv, &u);
-            int eval = minimax(chess, depth-1, false, engine);
-            unmakeMove(chess, mv, &u);
-            if (eval > bestEval) { bestEval = eval; bestMove = mv; }
-        }
+typedef struct {
+    ChessState position;
+    Move move;
+    int depth;
+    int score;
+    Engine* enginePtr;
+
+    SDL_AtomicInt* sharedAlpha;
+    bool isWhiteRoot;
+} RootThread;
+
+int SDLCALL root_worker(void* data) {
+    RootThread* rt = (RootThread*)data;
+    UndoInfo u;
+    makeMove(&rt->position, rt->move, &u);
+    int shared = SDL_GetAtomicInt(rt->sharedAlpha);
+    int score;
+    if (rt->isWhiteRoot) {
+        int alpha = shared;
+        int beta  = INF;
+        score = minimaxAB(&rt->position, rt->depth - 1, alpha, beta, rt->enginePtr);
+        int old;
+        do {
+            old = SDL_GetAtomicInt(rt->sharedAlpha);
+            if (score <= old) break;
+        } while (!SDL_CompareAndSwapAtomicInt(rt->sharedAlpha, old, score));
     } else {
-        int bestEval = 10000;
-        for (int i=0;i<moves.count;i++){
-            Move mv = moves.moves[i];
-            UndoInfo u;
-            makeMove(chess, mv, &u);
-            int eval = minimax(chess, depth-1, true, engine);
-            unmakeMove(chess, mv, &u);
-            if (eval < bestEval) { bestEval = eval; bestMove = mv; }
+        int alpha = -INF;
+        int beta  = shared;
+        score = minimaxAB(&rt->position, rt->depth - 1, alpha, beta, rt->enginePtr);
+        int old;
+        do {
+            old = SDL_GetAtomicInt(rt->sharedAlpha);
+            if (score >= old) break;
+        } while (!SDL_CompareAndSwapAtomicInt(rt->sharedAlpha, old, score));
+    }
+    rt->score = score;
+    return 0;
+}
+
+Move findBestMove(ChessState* chess, int depth, Engine* engine) {
+    MoveList rootMoves;
+    getAllMoves(chess, &rootMoves);
+    Move bestMove = rootMoves.moves[0];
+    int bestScore = chess->whiteToMove ? -INF : INF;
+    {
+        ChessState tmp = *chess;
+        UndoInfo u;
+        makeMove(&tmp, rootMoves.moves[0], &u);
+        bestScore = minimaxAB(&tmp, depth - 1, -INF, INF, engine);
+        bestMove  = rootMoves.moves[0];
+    }
+    SDL_AtomicInt sharedAlpha;
+    SDL_SetAtomicInt(&sharedAlpha, bestScore);
+    int n = SDL_GetNumLogicalCPUCores();
+    int jobs = rootMoves.count - 1;
+    if (n > jobs) n = jobs;
+
+    RootThread threads[256];
+    SDL_Thread* workers[256];
+    for (int i = 1; i < rootMoves.count; i++) {
+        threads[i].position = *chess;
+        threads[i].move = rootMoves.moves[i];
+        threads[i].depth = depth;
+        threads[i].enginePtr = engine;
+        threads[i].sharedAlpha = &sharedAlpha;
+        threads[i].isWhiteRoot = chess->whiteToMove;
+
+        workers[i] = SDL_CreateThread(root_worker, "root", &threads[i]);
+    }
+    for (int i = 1; i < rootMoves.count; i++)
+        SDL_WaitThread(workers[i], NULL);
+    for (int i = 1; i < rootMoves.count; i++) {
+        int s = threads[i].score;
+        if ((chess->whiteToMove && s > bestScore) ||
+            (!chess->whiteToMove && s < bestScore)) {
+            bestScore = s;
+            bestMove = threads[i].move;
         }
     }
     return bestMove;
 }
 
-/* Engine thread: copies chess state, searches, writes result under mutex */
+/* Engine thread: copies chess state, searches, writes result under mutex (mutual exclusion lock for multithreading) */
 static int engine_thread_func(void* arg) {
     AppState* state = arg;
 
@@ -492,18 +805,15 @@ static int engine_thread_func(void* arg) {
     SDL_SetAtomicInt(&state->engine.progress.depthCompleted, 0);
     SDL_SetAtomicInt(&state->engine.progress.searching, 1);
 
-    Engine* engine = &state->engine;
-
     ChessState snapshot;
     SDL_LockMutex(state->engine.mutex);
     snapshot = state->chess;
     SDL_UnlockMutex(state->engine.mutex);
 
     Move best = {0};
-    const int maxDepth = 5;
 
-    for (int d = 1; d <= maxDepth; d++) {
-        best = findBestMove(&snapshot, d, engine);
+    for (int d = 1; d <= MOVE_DEPTH; d++) {
+        best = findBestMove(&snapshot, d, &state->engine);
         SDL_SetAtomicInt(&state->engine.progress.depthCompleted, d);
     }
 
@@ -567,11 +877,10 @@ static Clay_RenderCommandArray CreateLayout(AppState* state) {
     int nodes     = SDL_GetAtomicInt(&state->engine.progress.nodesSearched);
     int depth     = SDL_GetAtomicInt(&state->engine.progress.depthCompleted);
     int searching = SDL_GetAtomicInt(&state->engine.progress.searching);
-    const int maxDepth = 5;
     const int barTotalW = 300;
     const int barInnerMax = (barTotalW - 8);
     float t = 0.0f;
-    if (searching && maxDepth > 0) t = (float)depth / (float)maxDepth;
+    if (searching && MOVE_DEPTH > 0) t = (float)depth / (float)MOVE_DEPTH;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
     int innerW = (int)(barInnerMax * t);
@@ -608,7 +917,7 @@ static Clay_RenderCommandArray CreateLayout(AppState* state) {
                     char statusBuf[80];
                     SDL_snprintf(statusBuf, sizeof(statusBuf), "%s  depth: %d/%d  nodes: %d",
                                  searching ? "Searching" : "Idle",
-                                 depth, maxDepth, nodes);
+                                 depth, MOVE_DEPTH, nodes);
                     Clay_String statusStr = { .chars = statusBuf, .length = (int)SDL_strlen(statusBuf) };
                     CLAY_TEXT(statusStr, CLAY_TEXT_CONFIG({ .fontId = FONT_ID, .fontSize = 12, .textColor = COLOR_TEXT }));
                 }
